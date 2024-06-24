@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Leaflet Map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        #map {
+            height: 100vh;
+        }
+
+        .button {
+            position: absolute;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            padding: 10px 20px;
+            background-color: white;
+            border: 1px solid #ccc;
+            cursor: pointer;
+            margin-top: 5px;
+        }
+
+        #randomButton {
+            margin-top: 0;
+        }
+
+        #routeButton {
+            margin-top: 45px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <button id="randomButton" class="button">Select 5 Random Offices</button>
+    <button id="routeButton" class="button">Calculate Route</button>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+        const map = L.map('map').setView([42.6977, 23.3219], 12);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        let markers = [];
+        let selectedMarkers = [];
+        let roadData = [];
+
+
+        fetch('http://localhost:3000/api/points')
+            .then(response => response.json())
+            .then(data => {
+                data.forEach(point => {
+                    const geometry = JSON.parse(point.geometry);
+                    const coordinates = geometry.coordinates[0];
+                    const latLng = [coordinates[1], coordinates[0]];
+                    const marker = L.marker(latLng).addTo(map)
+                        .bindPopup(`<b>Address:</b> ${point.address}`);
+                    markers.push(marker);
+                });
+            })
+            .catch(error => console.error('Error fetching data:', error));
+
+        document.getElementById('routeButton').addEventListener('click', async () => {
+            if (selectedMarkers.length < 2) {
+                alert('Select at least 2 offices to calculate the route.');
+                return;
+            }
+
+            try {
+                const response = await fetch('http://localhost:3000/api/roads');
+                roadData = await response.json();
+
+                const routeCoordinates = calculateRoute(selectedMarkers, roadData);
+                drawRoute(routeCoordinates);
+            } catch (error) {
+                console.error('Error fetching road data:', error);
+            }
+        });
+
+
+        function calculateRoute(markers, roadData) {
+            // Step 1: Build a graph representation of the road network
+            const graph = buildGraph(roadData);
+
+            // Step 2: Initialize Dijkstra's algorithm data structures
+            const routeCoordinates = [];
+            for (let i = 0; i < markers.length - 1; i++) {
+                const startMarker = markers[i];
+                const endMarker = markers[i + 1];
+
+                // Find node IDs for start and end markers
+                const startNodeId = findClosestNodeId(startMarker.getLatLng(), graph.nodes);
+                const endNodeId = findClosestNodeId(endMarker.getLatLng(), graph.nodes);
+
+                // Step 3: Perform Dijkstra's algorithm between consecutive markers
+                const { path, distance } = dijkstra(graph, startNodeId, endNodeId);
+
+                // Convert node IDs back to coordinates
+                const segmentCoordinates = path.map(nodeId => {
+                    const node = graph.nodes[nodeId];
+                    return L.latLng(node.lat, node.lng);
+                });
+
+                routeCoordinates.push(...segmentCoordinates);
+            }
+
+            return routeCoordinates;
+        }
+
+        function dijkstra(graph, startNodeId, endNodeId) {
+            const distances = {};
+            const previous = {};
+            const queue = new PriorityQueue();
+
+            Object.keys(graph.nodes).forEach(nodeId => {
+                distances[nodeId] = nodeId === startNodeId ? 0 : Infinity;
+                queue.enqueue(nodeId, distances[nodeId]);
+            });
+
+            while (!queue.isEmpty()) {
+                const currentNodeId = queue.dequeue();
+
+                if (currentNodeId === endNodeId) {
+                    break; // Found shortest path to the destination
+                }
+
+                if (distances[currentNodeId] === Infinity) {
+                    continue; // Skip nodes that are unreachable
+                }
+
+                if (graph.edges[currentNodeId] !== undefined) {
+                    graph.edges[currentNodeId].forEach(neighbor => {
+                        const alt = distances[currentNodeId] + neighbor.weight;
+                        if (alt < distances[neighbor.target]) {
+                            distances[neighbor.target] = alt;
+                            previous[neighbor.target] = currentNodeId;
+                            queue.enqueue(neighbor.target, alt);
+                        }
+                    });
+                }
+            }
+
+            // Reconstruct the shortest path
+            const path = [];
+            let currentNode = endNodeId;
+            while (currentNode !== undefined) {
+                path.unshift(currentNode);
+                currentNode = previous[currentNode];
+            }
+
+            return { path, distance: distances[endNodeId] };
+        }
+
+
+        function buildGraph(roadData) {
+            const nodes = {};
+            const edges = {};
+
+            roadData.forEach(road => {
+                const coordinates = road.geometry.coordinates[0];
+                const startNodeId = addNode(coordinates[0]);
+                const endNodeId = addNode(coordinates[coordinates.length - 1]);
+
+                addEdge(startNodeId, endNodeId, coordinates);
+            });
+
+            function addNode(coordinates) {
+                const nodeId = `${coordinates[1]},${coordinates[0]}`;
+                if (!nodes[nodeId]) {
+                    nodes[nodeId] = {
+                        lat: coordinates[1],
+                        lng: coordinates[0]
+                    };
+                }
+                return nodeId;
+            }
+
+            function addEdge(startNodeId, endNodeId, coordinates) {
+                const weight = calculateLength(coordinates);
+                if (!edges[startNodeId]) {
+                    edges[startNodeId] = [];
+                }
+                edges[startNodeId].push({
+                    target: endNodeId,
+                    weight: weight
+                });
+            }
+
+            function calculateLength(coordinates) {
+                let length = 0;
+                for (let i = 1; i < coordinates.length; i++) {
+                    const from = L.latLng(coordinates[i - 1][1], coordinates[i - 1][0]);
+                    const to = L.latLng(coordinates[i][1], coordinates[i][0]);
+                    length += from.distanceTo(to);
+                }
+                return length;
+            }
+
+            return {
+                nodes: nodes,
+                edges: edges
+            };
+        }
+
+        function findClosestNodeId(latLng, nodes) {
+            let closestNodeId = null;
+            let minDistance = Infinity;
+
+            Object.keys(nodes).forEach(nodeId => {
+                const node = nodes[nodeId];
+                const distance = latLng.distanceTo(L.latLng(node.lat, node.lng));
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    closestNodeId = nodeId;
+                }
+            });
+
+            return closestNodeId;
+        }
+
+        class PriorityQueue {
+            constructor() {
+                this.elements = [];
+            }
+
+            enqueue(element, priority) {
+                this.elements.push({ element, priority });
+                this.sort();
+            }
+
+            dequeue() {
+                return this.elements.shift().element;
+            }
+
+            sort() {
+                this.elements.sort((a, b) => a.priority - b.priority);
+            }
+
+            isEmpty() {
+                return this.elements.length === 0;
+            }
+        }
+
+        function drawRoute(coordinates) {
+            if (coordinates.length < 2) {
+                console.error('Cannot draw route with less than 2 points.');
+                return;
+            }
+
+            const route = L.polyline(coordinates, { color: 'blue' }).addTo(map);
+            map.fitBounds(route.getBounds());
+        }
+
+        document.getElementById('randomButton').addEventListener('click', async () => {
+            markers.forEach(marker => marker.setIcon(L.icon({
+                iconUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon.png',
+                shadowUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-shadow.png'
+            })));
+
+            selectedMarkers = [];
+            const markersCopy = [...markers];
+
+            for (let i = 0; i < 5; i++) {
+                const randomIndex = Math.floor(Math.random() * markersCopy.length);
+                selectedMarkers.push(markersCopy.splice(randomIndex, 1)[0]);
+            }
+
+            selectedMarkers.forEach((marker, index) => {
+                marker.setIcon(L.icon({
+                    iconUrl: 'https://www.google.com/mapfiles/ms/icons/green-dot.png',
+                    iconSize: [32, 32],
+                    iconAnchor: [16, 32],
+                    popupAnchor: [0, -32]
+                }));
+                marker.bindPopup(`<b>Address:</b> ${marker.getPopup().getContent()} <br><b>Label:</b> ${index + 1}`);
+
+            });
+
+            try {
+                const response = await fetch('http://localhost:3000/api/roads');
+                roadData = await response.json();
+
+                // Snap selected markers to the nearest points on the road network
+                snapPointsToRoads(selectedMarkers, roadData);
+            } catch (error) {
+                console.error('Error fetching road data:', error);
+                return;
+            }
+        });
+
+        function snapPointsToRoads(markers, roadData) {
+            markers.forEach(marker => {
+                const latLng = marker.getLatLng();
+                const closestPoint = getClosestPointOnRoad(latLng, roadData);
+                marker.setLatLng(closestPoint);
+            });
+        }
+
+        function getClosestPointOnRoad(latLng, roadData) {
+            let closestPoint = null;
+            let minDistance = Infinity;
+
+            roadData.forEach(road => {
+                const coordinates = road.geometry.coordinates[0];
+                for (let i = 0; i < coordinates.length - 1; i++) {
+                    const start = L.latLng(coordinates[i][1], coordinates[i][0]);
+                    const end = L.latLng(coordinates[i + 1][1], coordinates[i + 1][0]);
+                    const point = closestPointOnSegment(latLng, start, end);
+                    const distance = latLng.distanceTo(point);
+
+                    if (distance < minDistance) {
+                        minDistance = distance;
+                        closestPoint = point;
+                    }
+                }
+            });
+
+            return closestPoint;
+        }
+
+        function closestPointOnSegment(p, p1, p2) {
+            const x = p1.lat;
+            const y = p1.lng;
+            const dx = p2.lat - p1.lat;
+            const dy = p2.lng - p1.lng;
+            const t = ((p.lat - x) * dx + (p.lng - y) * dy) / (dx * dx + dy * dy);
+            const clampT = Math.max(0, Math.min(1, t));
+            return L.latLng(x + clampT * dx, y + clampT * dy);
+        }
+    </script>
+</body>
+
+</html>
